@@ -1,15 +1,15 @@
 import asyncio
 import datetime
-import io
 import hashlib
+import io
+import time
+from collections import namedtuple
 from contextlib import redirect_stdout
 from typing import Iterable
-import time
-
-import aiohttp
+from asyncio.protocols import BaseProtocol
 from aiohttp import ClientSession
 from aiohttp import web
-from aiohttp.web import Application, StreamResponse, run_app, Response
+from aiohttp.web import Application, StreamResponse, run_app, Request
 
 START = time.time()
 
@@ -121,25 +121,35 @@ render_webpage = """
   </body>
 </html>
 """.format
+DEFAULT_TTL = 60 * 60 * 24
 
 
-def hash_request(request):
-    sha1 = hashlib.sha1()
-    sha1.update(request)
-    return sha1.hexdigest()
+class Store:
+    _cache = {}
+    _expires = {}
+    _max_objects = 100
 
+    async def set(self, key: bytes, value: object, ttl: int = DEFAULT_TTL):
+        self._cache[key] = value
+        self._expires[key] = time.time() + ttl
+        return value
 
-def curl(url):
-    session = ClientSession()
-    response = yield from session.request('GET', url)
+    async def get(self, key: bytes) -> None or object:
+        value = self._cache.get(key, None)
 
-    print(repr(response))
+        if value is None:
+            return
 
-    chunk = yield from response.content.read()
-    print('Downloaded: %s' % len(chunk))
+        exp = self._expires.get(key, -1)
 
-    response.close()
-    yield from session.close()
+        print(exp, '>', time.time())
+
+        if exp is None or exp <= time.time():
+            del self._cache[key]
+            del self._expires[key]
+            return None
+
+        return value
 
 
 def render_table(rows: Iterable) -> str:
@@ -175,16 +185,77 @@ async def landing_view(request):
     return resp
 
 
-async def proxy_handler(request):
-    headers = request.headers.copy()
-    headers['Via'] = 'aioproxy'
-    async with ClientSession() as session:
-        async with session.request(request.method, request.rel_url, headers=headers) as resp:
-            stream = StreamResponse(status=resp.status, reason=resp.reason, headers=headers)
-            await stream.prepare(request)
-            async for data in resp.content.iter_chunked(1024):
-                stream.write(data)
-    return stream
+def hash_request(request: Request) -> bytes:
+    sha1 = hashlib.sha1()
+    sha1.update(request.method.encode())
+    sha1.update(str(request.rel_url).encode())
+    return sha1.digest()
+
+
+store = Store()
+
+ItemResponse = namedtuple('ItemResponse', ['status', 'reason', 'method', 'url', 'headers', 'body'])
+
+
+async def relay_stream(reader, writer):
+    while True:
+        data = await reader.read(1024)
+        if not data:
+            break
+        print('received data', data)
+        writer.write(data)
+        await writer.drain()
+
+    writer.close()
+
+
+async def proxy_handler(request: Request):
+    hash_key = hash_request(request)
+    response = await store.get(hash_key)
+    loop = asyncio.get_event_loop()
+
+    if request.method == 'CONNECT':
+        host, port = request.rel_url.path.split(':')
+        port = int(port)
+
+        reader, writer = await asyncio.open_connection(
+            host=host, port=port)
+
+        asyncio.ensure_future(relay_stream(reader, writer), loop=loop)
+
+        return StreamResponse(status=200, reason='Connection Established')
+
+    if response:
+        print('HIT')
+        stream = StreamResponse(status=response.status, reason=response.reason, headers=response.headers)
+        stream.headers['X-Cache'] = 'HIT'
+
+        await stream.prepare(request)
+        stream.write(response.body)
+
+        return stream
+    else:
+
+        with ClientSession() as session:
+            headers = request.headers.copy()
+
+            async with session.request(request.method, request.rel_url, headers=headers) as resp:
+                response = ItemResponse(resp.status,
+                                        resp.reason,
+                                        request.method,
+                                        request.rel_url,
+                                        headers,
+                                        await resp.read())
+
+                loop.create_task(store.set(hash_key, response))
+
+                stream = StreamResponse(status=response.status, reason=response.reason, headers=response.headers)
+                stream.headers['X-Cache'] = 'Miss'
+
+                await stream.prepare(request)
+                stream.write(response.body)
+
+            return stream
 
 
 async def init_proxy(loop):
