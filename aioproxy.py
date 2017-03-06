@@ -6,10 +6,10 @@ import time
 from collections import namedtuple
 from contextlib import redirect_stdout
 from typing import Iterable
-from asyncio.protocols import BaseProtocol
+
 from aiohttp import ClientSession
 from aiohttp import web
-from aiohttp.web import Application, StreamResponse, run_app, Request
+from aiohttp.web import Application, StreamResponse, run_app, Request, Response
 
 START = time.time()
 
@@ -197,9 +197,16 @@ store = Store()
 ItemResponse = namedtuple('ItemResponse', ['status', 'reason', 'method', 'url', 'headers', 'body'])
 
 
-async def relay_stream(reader, writer):
+async def relay_stream(request: Request):
+    host, port = request.rel_url.path.split(':')
+    port = int(port)
+    reader, writer = await asyncio.open_connection(
+        host=host, port=port, ssl=True)
+
     while True:
-        data = await reader.read(1024)
+        await writer.drain()
+
+        data = await reader.read(1024 * 1024)
         if not data:
             break
         print('received data', data)
@@ -215,15 +222,11 @@ async def proxy_handler(request: Request):
     loop = asyncio.get_event_loop()
 
     if request.method == 'CONNECT':
-        host, port = request.rel_url.path.split(':')
-        port = int(port)
+        asyncio.ensure_future(relay_stream(request), loop=loop)
 
-        reader, writer = await asyncio.open_connection(
-            host=host, port=port)
-
-        asyncio.ensure_future(relay_stream(reader, writer), loop=loop)
-
-        return StreamResponse(status=200, reason='Connection Established')
+        return Response(status=200,
+                        reason='Connection Established',
+                        headers={'Proxy-agent': 'aioproxy'})
 
     if response:
         print('HIT')
